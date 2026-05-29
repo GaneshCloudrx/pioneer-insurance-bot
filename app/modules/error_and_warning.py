@@ -5,6 +5,7 @@ Returns (passed, non_bypassable) so the caller can decide next steps.
 """
 import time
 from pywinauto.application import Application
+from pywinauto import Desktop
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import config
@@ -122,34 +123,94 @@ def extract_error_list():
         return ""
 
 
-def handle_alerts_popup():
+def _locate_alerts_window(wait_seconds=4):
     """
-    Handle the optional Alerts popup that may appear after saving.
-    Clicks Save & Continue (uxSaveContinue) if the window is found.
-    Returns True always (popup is optional).
+    Find the "Alerts - <patient> ..." window. It is opened as a modal child of
+    the Edit/Fill Rx window, so we try both:
+      1. As a descendant of the Edit Rx window (modal child).
+      2. As a top-level desktop window (fallback in case the modal is reported
+         as a standalone Win32 window).
+
+    Polls until the wait_seconds budget is exhausted before giving up.
+
+    Returns:
+        The matched WindowSpecification, or None if not found.
     """
-    try:
-        app = Application(backend="uia").connect(title_re=".*Alerts.*", timeout=config.TIMEOUT_POPUP_CHECK)
-        alerts_win = app.window(title_re=".*Alerts -.*")
-        alerts_win.wait("visible", timeout=config.TIMEOUT_POPUP_CHECK)
+    desktop = Desktop(backend="uia")
+    deadline = time.time() + max(wait_seconds, 0)
+    title_pattern = r".*Alerts\s*-.*"
+
+    while True:
         try:
-            captcha_label = alerts_win.child_window(auto_id="uxConfirmCharacters", control_type="Text")
-            if captcha_label.exists(timeout=1):
-                captcha_text = captcha_label.window_text().strip()
-                captcha_input = alerts_win.child_window(auto_id="uxConfirmationCharacters", control_type="Edit")
-                captcha_input.set_edit_text(captcha_text)
-                time.sleep(0.3)
-                log_print(f"✓ Alerts captcha filled: '{captcha_text}'")
+            edit_rx = desktop.window(title_re=config.SELECTOR_EDIT_RX_FULL)
+            if edit_rx.exists(timeout=0):
+                child = edit_rx.child_window(title_re=title_pattern, control_type="Window")
+                if child.exists(timeout=0):
+                    return child
         except Exception:
             pass
 
-        save_btn = alerts_win.child_window(auto_id="uxSaveContinue", control_type="Button")
+        try:
+            top_level = desktop.window(title_re=title_pattern, control_type="Window")
+            if top_level.exists(timeout=0):
+                return top_level
+        except Exception:
+            pass
+
+        if time.time() >= deadline:
+            return None
+        time.sleep(0.3)
+
+
+def handle_alerts_popup():
+    """
+    Handle the optional Alerts popup that may appear after Save & Continue.
+
+    The popup is a modal child of the Edit/Fill Rx window with title
+    "Alerts - <patient name>...". When present, fill its captcha (if any) and
+    click the "Save & Continue - F12" button (auto_id=uxSaveContinue).
+
+    Returns True always (popup is optional).
+    """
+    alerts_win = _locate_alerts_window(wait_seconds=4)
+    if alerts_win is None:
+        log_print("[ALERTS] No alerts popup detected")
+        return True
+
+    try:
+        alerts_win.wait("visible", timeout=2)
+        try:
+            alerts_win.set_focus()
+        except Exception:
+            pass
+        time.sleep(0.3)
+
+        # Optional captcha
+        try:
+            captcha_label = alerts_win.child_window(
+                auto_id="uxConfirmCharacters", control_type="Text"
+            )
+            if captcha_label.exists(timeout=1):
+                captcha_text = captcha_label.window_text().strip()
+                if captcha_text:
+                    captcha_input = alerts_win.child_window(
+                        auto_id="uxConfirmationCharacters", control_type="Edit"
+                    )
+                    captcha_input.set_edit_text(captcha_text)
+                    time.sleep(0.3)
+                    log_print(f"[ALERTS] Captcha filled: '{captcha_text}'")
+        except Exception:
+            pass
+
+        save_btn = alerts_win.child_window(
+            auto_id="uxSaveContinue", control_type="Button"
+        )
         save_btn.wait("enabled", timeout=config.TIMEOUT_ELEMENT_EXISTS)
         save_btn.click_input()
-        log_print("✓ Alerts popup — Save & Continue clicked")
+        log_print("[ALERTS] Save & Continue clicked")
         time.sleep(0.5)
-    except Exception:
-        pass
+    except Exception as e:
+        log_print(f"[ALERTS] Failed to handle alerts popup: {e}")
     return True
 
 

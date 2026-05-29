@@ -47,31 +47,53 @@ def click_edit_patient():
         return False
 
 
+# Likely column header names for the payer/insurance display column in the
+# Pay Methods grid. We try these (case-insensitive) when extracting the
+# payer name from a matching row.
+_PAYER_COLUMN_NAMES = (
+    "display name",
+    "payer name",
+    "payer",
+    "plan name",
+    "plan",
+    "insurance",
+    "name",
+    "third party",
+    "third party name",
+)
+
+
 def has_insurance(card_holder_id):
     """
     Check if an insurance with the same Cardholder ID already exists in the
-    patient's pay methods (third party insurance) grid.
+    patient's pay methods (third party insurance) grid AND return the payer
+    name of the matching row so the caller can use it later to select the
+    Primary insurance on the Dispense tab.
 
-    The API's card_holder_id may contain alphabetic characters (e.g. "ABC111513983").
-    Only the numeric portion is used for comparison. Each cell value in the grid
-    is also reduced to its digits, then matched as a substring so that a stored
-    cardholder id is considered the same insurance regardless of any letter
-    prefixes/suffixes either side may carry.
+    The API's card_holder_id may contain alphabetic characters
+    (e.g. "ABC111513983"). Only the numeric portion is used for comparison.
+    Each cell value in the grid is also reduced to its digits, then matched as
+    a substring so the cardholder id is considered the same insurance
+    regardless of letter prefixes/suffixes either side may carry.
 
     Args:
-        card_holder_id: Card Holder ID from the API response (may contain letters)
+        card_holder_id: Card Holder ID from the API response (may contain letters).
 
     Returns:
-        bool: True if a row with a matching cardholder id already exists
+        tuple(bool, str):
+            * found      - True if a row with a matching cardholder id exists.
+            * payer_name - The display/payer name from that row (best-effort
+              based on the column header). Empty string when no match is
+              found or the column couldn't be identified.
     """
     if not card_holder_id:
         log_print("[INSURANCE] No cardholder ID provided — cannot check grid")
-        return False
+        return False, ""
 
     numeric_id = "".join(ch for ch in str(card_holder_id) if ch.isdigit())
     if not numeric_id:
         log_print(f"[INSURANCE] Cardholder ID '{card_holder_id}' has no digits to match")
-        return False
+        return False, ""
 
     try:
         desktop = Desktop(backend="uia")
@@ -84,22 +106,49 @@ def has_insurance(card_holder_id):
         for child in grid.children():
             if not child.window_text().startswith("Row"):
                 continue
+
+            row_cells = {}
+            row_matched = False
+
             for cell in child.children():
                 try:
-                    val = cell.legacy_properties().get("Value", "")
+                    column = (cell.window_text() or "").strip()
+                    val = (cell.legacy_properties().get("Value", "") or "")
+                    if column:
+                        row_cells[column] = val
                     cell_numeric = "".join(ch for ch in val if ch.isdigit())
                     if cell_numeric and numeric_id in cell_numeric:
-                        log_print(f"[INSURANCE] Cardholder ID '{numeric_id}' already exists in insurance grid")
-                        return True
+                        row_matched = True
                 except Exception:
                     pass
 
+            if not row_matched:
+                continue
+
+            payer_name = ""
+            for column, value in row_cells.items():
+                if column.strip().lower() in _PAYER_COLUMN_NAMES and value.strip():
+                    payer_name = value.strip()
+                    break
+
+            if not payer_name:
+                log_print(
+                    f"[INSURANCE] Cardholder ID '{numeric_id}' matched but payer "
+                    f"column not identified. Row columns: {list(row_cells.keys())}"
+                )
+            else:
+                log_print(
+                    f"[INSURANCE] Cardholder ID '{numeric_id}' already exists "
+                    f"in insurance grid (payer: '{payer_name}')"
+                )
+            return True, payer_name
+
         log_print(f"[INSURANCE] Cardholder ID '{numeric_id}' not found in insurance grid")
-        return False
+        return False, ""
 
     except Exception as e:
         log_print(f"[INSURANCE] Failed to check insurance grid: {e}")
-        return False
+        return False, ""
 
 
 def _is_pcn_blank(pcn):
@@ -305,6 +354,33 @@ def _search_third_party_by_bin_pcn(search_window, bin_number, pcn, pcn_blank):
     return _select_search_result(search_window, prefer_row_without_pcn=pcn_blank)
 
 
+def _read_pay_method_display_name(pay_window):
+    """
+    Read the Display Name field (`uxDisplayName`) on the Pay Method (Third
+    Party) window. Pioneer populates this control with the plan name once a
+    row has been selected from the advanced search results — we keep that
+    name so it can later drive the `(P)<first word>` selection on the
+    Dispense tab.
+
+    Returns "" on any failure (the caller treats the absent name gracefully).
+    """
+    try:
+        display_field = pay_window.child_window(
+            auto_id="uxDisplayName", control_type="Edit"
+        )
+        display_name = (
+            display_field.legacy_properties().get("Value", "") or ""
+        ).strip()
+        if display_name:
+            log_print(f"[INSURANCE] Display Name extracted: '{display_name}'")
+        else:
+            log_print("[INSURANCE] Display Name field present but empty")
+        return display_name
+    except Exception as e:
+        log_print(f"[INSURANCE] Could not read Display Name: {e}")
+        return ""
+
+
 def add_insurance_to_grid(payer_name, bin_number="", pcn="", card_holder_id="", group_number=""):
     """
     Add a new insurance entry to the patient's pay methods grid using the
@@ -318,7 +394,9 @@ def add_insurance_to_grid(payer_name, bin_number="", pcn="", card_holder_id="", 
     5. Trigger search; pick the first result row — or, when PCN was blank/na,
        the first row whose PCN column is empty
     6. Pay Method window is populated with the selected plan
-    7. Fill Card Holder ID, Group Number, Billing Order and save
+    7. Read the Display Name (uxDisplayName) for later Primary insurance
+       selection on the Dispense tab
+    8. Fill Card Holder ID, Group Number, Billing Order and save
 
     Args:
         payer_name: Insurance payer name (kept for logging only)
@@ -328,7 +406,11 @@ def add_insurance_to_grid(payer_name, bin_number="", pcn="", card_holder_id="", 
         group_number: Group number to fill in the Pay Method window
 
     Returns:
-        bool: True if insurance was successfully added
+        tuple(bool, str):
+            * success      - True if insurance was successfully added.
+            * display_name - The plan's Display Name as it appears on the
+              Pay Method window (best-effort). Empty when no plan was
+              selected or the field could not be read.
     """
     try:
         desktop = Desktop(backend="uia")
@@ -351,7 +433,7 @@ def add_insurance_to_grid(payer_name, bin_number="", pcn="", card_holder_id="", 
         if not bin_number:
             log_print("[INSURANCE] No BIN provided — cannot perform advanced search")
             _cancel_pay_method(pay_window)
-            return False
+            return False, ""
 
         try:
             # This version of pywinauto's descendants() doesn't accept `auto_id`
@@ -367,7 +449,7 @@ def add_insurance_to_grid(payer_name, bin_number="", pcn="", card_holder_id="", 
 
             if not candidates:
                 log_print("[INSURANCE] No AdvancedSearchButton found in Pay Method window")
-                return False
+                return False, ""
 
             # Multiple binoculars exist in the Pay Method window (e.g. one for
             # the third-party plan and others for cardholder/prescriber lookups).
@@ -382,7 +464,7 @@ def add_insurance_to_grid(payer_name, bin_number="", pcn="", card_holder_id="", 
             )
         except Exception as e:
             log_print(f"[INSURANCE] Could not click binocular icon: {e}")
-            return False
+            return False, ""
 
         search_window = desktop.window(title_re=".*Search For Third Party.*")
         try:
@@ -390,7 +472,7 @@ def add_insurance_to_grid(payer_name, bin_number="", pcn="", card_holder_id="", 
             search_window.set_focus()
         except Exception as e:
             log_print(f"[INSURANCE] Search For Third Party window did not appear: {e}")
-            return False
+            return False, ""
 
         selected = _search_third_party_by_bin_pcn(
             search_window, bin_number, pcn, pcn_blank
@@ -400,10 +482,14 @@ def add_insurance_to_grid(payer_name, bin_number="", pcn="", card_holder_id="", 
             log_print("[INSURANCE] No matching plan selected from advanced search")
             _cancel_third_party_search(desktop)
             _cancel_pay_method(pay_window)
-            return False
+            return False, ""
 
         # Pay Method window should now be focused with the selected plan
         pay_window.wait('visible', timeout=config.TIMEOUT_ELEMENT_VISIBLE)
+
+        # Capture the plan's Display Name as early as possible — Pioneer
+        # auto-populates it once a row was chosen from the search results.
+        display_name = _read_pay_method_display_name(pay_window)
 
         # Click Start hyperlink to enable fields
         try:
@@ -474,16 +560,19 @@ def add_insurance_to_grid(payer_name, bin_number="", pcn="", card_holder_id="", 
                 cancel_btn.click_input()
                 time.sleep(0.5)
                 log_print("[INSURANCE] Pay Method window cancelled")
-                return False
+                return False, ""
         except Exception:
             pass
 
-        log_print(f"[INSURANCE] Insurance '{payer_name}' added successfully")
-        return True
+        log_print(
+            f"[INSURANCE] Insurance '{payer_name}' added successfully "
+            f"(Display Name: '{display_name}')"
+        )
+        return True, display_name
 
     except Exception as e:
         log_print(f"[INSURANCE] Failed to add insurance: {e}")
-        return False
+        return False, ""
 
 
 def close_edit_patient(save=True):
@@ -528,50 +617,79 @@ def close_edit_patient(save=True):
         return False
 
 
-def _notify_api_failed(cld_patient_id):
-    """Best-effort 'failed' status update; never raises."""
+# Status codes returned by check_and_add_insurance(). Importable by callers.
+INSURANCE_EXISTS = "exists"
+INSURANCE_ADDED = "added"
+INSURANCE_FAILED = "failed"
+
+
+def _notify_api(cld_patient_id, status):
+    """Best-effort status update to the portal; never raises."""
     if cld_patient_id is None:
         return
     try:
         from modules.insurance_api import update_status
-        update_status(cld_patient_id, "failed")
+        update_status(cld_patient_id, status)
     except Exception as e:
-        log_print(f"[INSURANCE] Failed to send 'failed' status to API: {e}")
+        log_print(f"[INSURANCE] Failed to send '{status}' status to API: {e}")
 
 
 def check_and_add_insurance(insurance_data, cld_patient_id=None):
     """
     Main workflow: Edit Patient -> check if insurance exists -> add if missing -> close.
 
-    When the insurance plan cannot be added (e.g. no matching plan in the
-    advanced BIN/PCN search), all three windows are cancelled in order
-    (Third Party Search -> Pay Method (Third Party) -> Edit Patient) and the
-    portal is notified via `update_status(cld_patient_id, "failed")`.
+    The patient's Pay Methods grid is matched by Cardholder ID (numeric digits
+    only).
+      * If a row already matches, no add is performed, the matching row's
+        payer/display name is captured for later Primary-insurance selection,
+        and the portal is notified 'pms_synced'.
+      * If a new plan must be added, the binocular BIN/PCN search flow is
+        used and the Pay Method window's Display Name is captured.
+      * When the plan cannot be added, the portal is notified 'failed'.
 
     Args:
         insurance_data: dict with keys: payer, card_holder_id, group_number, bin, pcn
         cld_patient_id: Optional cld_patient_id from the API response. When
-            provided, a 'failed' status update is sent if the plan cannot be
-            added.
+            provided, the appropriate status ('pms_synced' or 'failed') is
+            posted to the portal.
 
     Returns:
-        bool: True if insurance is present (already existed or successfully added)
+        tuple(str, str):
+            * status         - one of the module-level constants:
+                * `INSURANCE_EXISTS` - cardholder ID already matched; the
+                  caller should still ensure the Primary combo on the
+                  Dispense tab is set to this plan before saving the Rx.
+                * `INSURANCE_ADDED`  - new plan added; caller continues
+                  saving the Rx (and may need to set Primary).
+                * `INSURANCE_FAILED` - plan could not be added; caller
+                  should cancel and treat as a business error.
+            * insurance_name - Display/payer name of the matched (EXISTS)
+              or newly added (ADDED) plan; empty string on FAILED or when
+              the field/column couldn't be read. Used by the Dispense Primary
+              selector as `(P)<first word>` so Pioneer disambiguates between
+              multiple primary plans configured on the patient.
     """
     payer = insurance_data.get("payer", "")
     card_holder_id = insurance_data.get("card_holder_id", "")
     if not payer:
         log_print("[INSURANCE] No payer name in insurance data — skipping")
-        return False
+        return INSURANCE_FAILED, ""
 
     if not click_edit_patient():
-        _notify_api_failed(cld_patient_id)
-        return False
+        _notify_api(cld_patient_id, "failed")
+        return INSURANCE_FAILED, ""
 
-    if has_insurance(card_holder_id):
+    found, existing_name = has_insurance(card_holder_id)
+    if found:
         close_edit_patient(save=False)
-        return True
+        log_print(
+            "[INSURANCE] Cardholder ID already on file — marking patient pms_synced "
+            "(caller will still set Primary on the Dispense tab)"
+        )
+        _notify_api(cld_patient_id, "pms_synced")
+        return INSURANCE_EXISTS, existing_name
 
-    success = add_insurance_to_grid(
+    success, display_name = add_insurance_to_grid(
         payer_name=payer,
         bin_number=insurance_data.get("bin", ""),
         pcn=insurance_data.get("pcn", ""),
@@ -581,22 +699,26 @@ def check_and_add_insurance(insurance_data, cld_patient_id=None):
 
     if success:
         close_edit_patient(save=True)
-        return True
+        _notify_api(cld_patient_id, "pms_synced")
+        return INSURANCE_ADDED, display_name
     else:
         close_edit_patient(save=False)
-        _notify_api_failed(cld_patient_id)
-        return False
+        _notify_api(cld_patient_id, "failed")
+        return INSURANCE_FAILED, ""
 
 
 if __name__ == "__main__":
+    #use this data as test insurance data "payer":"Blue cross blue shield","card_holder_id":"Wyo919752481","group_number":"Bcbsman","bin":"610011","pcn":"Na"
     test_insurance = {
-        "payer": "Cigna",
-        "card_holder_id": "111513983",
-        "group_number": "CIGUG0000658718",
-        "bin": "017010",
-        "pcn": "0518GWH"
+        "payer": "Blue cross blue shield",
+        "card_holder_id": "Wyo9197524812",
+        "group_number": "Bcbsman",
+        "bin": "610011",
+        "pcn": "IRX"
     }
-    if check_and_add_insurance(test_insurance):
-        log_print("\nTEST PASSED")
+    status, insurance_name = check_and_add_insurance(test_insurance)
+    log_print(f"\nResult: status='{status}', insurance_name='{insurance_name}'")
+    if status in (INSURANCE_EXISTS, INSURANCE_ADDED):
+        log_print("TEST PASSED")
     else:
-        log_print("\nTEST FAILED")
+        log_print("TEST FAILED")

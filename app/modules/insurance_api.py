@@ -99,6 +99,7 @@ def fetch_insurance_data():
                       f"| Insurance: {insurance_primary.get('payer', '')} "
                       f"| Rx count: {len(rx_numbers)}")
 
+            reset_notified()
             return record
 
         except requests.exceptions.Timeout:
@@ -113,15 +114,51 @@ def fetch_insurance_data():
     return None
 
 
+# Tracks the cld_patient_id we have already posted a status for in this run.
+# `update_status` is idempotent per patient — only the FIRST call for a given
+# cld_patient_id actually hits the portal. Later calls (e.g. from main.py's
+# success/exception paths) are silently skipped so the API is called exactly
+# once per patient regardless of how many Rx numbers are processed afterwards.
+_notified_patient_id = None
+
+
+def reset_notified():
+    """
+    Clear the per-patient notification flag. Call this at the start of each
+    new patient (e.g. right after `fetch_insurance_data` returns) so the next
+    patient's first `update_status` call can go through.
+    """
+    global _notified_patient_id
+    _notified_patient_id = None
+
+
 def update_status(cld_patient_id, status):
     """
     Update the API with processing result for a patient.
     Endpoint: rpa_update_pending_patient_insurance_sync_status.php
 
+    Idempotent per patient: the first call for a given cld_patient_id is sent
+    to the portal; subsequent calls for the same patient are skipped (so we
+    don't downgrade `pms_synced` to `failed` if a later Rx save errors out).
+    Call `reset_notified()` between patients.
+
     Args:
-        cld_patient_id: The cld_patient_id from the API response
-        status: "pms_synced", "failed", or "skipped"
+        cld_patient_id: The cld_patient_id from the API response.
+        status: "pms_synced", "failed", or "skipped".
     """
+    global _notified_patient_id
+
+    if cld_patient_id is None or cld_patient_id == "":
+        log_print(f"[API UPDATE] No cld_patient_id — skipping '{status}' update")
+        return False
+
+    if _notified_patient_id == cld_patient_id:
+        log_print(
+            f"[API UPDATE] '{status}' skipped — cld_patient_id={cld_patient_id} "
+            f"already notified in this patient cycle"
+        )
+        return True
+
     headers = {
         "Content-Type": "application/json",
         "Authorization": config.API_AUTH_HEADER,
@@ -138,6 +175,7 @@ def update_status(cld_patient_id, status):
             headers=headers,
             timeout=config.API_TIMEOUT,
         )
+        _notified_patient_id = cld_patient_id
         log_print(f"[API UPDATE] {status} — cld_patient_id={cld_patient_id}")
         return True
     except Exception as e:

@@ -63,7 +63,7 @@ PIONEER_USERNAME = os.environ.get("PIONEER_USERNAME", "")
 PIONEER_PASSWORD = os.environ.get("PIONEER_PASSWORD", "")
 PIONEER_PIN = os.environ.get("PIONEER_PIN", "")
 PIONEER_ID_NAME = os.environ.get("PIONEER_ID_NAME", "")
-RPH_NAME = os.environ.get("RPH_NAME", PIONEER_ID_NAME)
+RPH_NAME = os.environ.get("RPH_NAME", "Stephanie Erwin")
 
 LOGIN_SERVER = ""
 if PHARMACY_NAME == "Metro":
@@ -118,7 +118,7 @@ SELECTOR_LOGIN = r".*Logon to PioneerRx.*"
 SELECTOR_MAIN = r".*(MainForm|Fill Requests).*"
 SELECTOR_FILL_REQUESTS = r".*(Fill Requests|Rx Profile|MainForm).*"
 SELECTOR_RX_PROFILE = r".*Rx Profile.*"
-SELECTOR_EDIT_RX = r".*(Edit|Fill Rx).*"
+SELECTOR_EDIT_RX = r".*(Edit|Fill Rx|Rx Profile).*"
 SELECTOR_EDIT_RX_FULL = r".*(Edit|Fill Rx|Fill Requests|Search For a Prescriber|Search For|Search For Compounds|Alerts).*"
 SELECTOR_EDIT_PATIENT = r".*(Edit Patient|Search For Third Party).*"    
 
