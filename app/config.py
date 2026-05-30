@@ -78,6 +78,12 @@ TIMEOUT_MAIN_WINDOW = 30
 TIMEOUT_ELEMENT_VISIBLE = 5
 TIMEOUT_ELEMENT_EXISTS = 5
 TIMEOUT_POPUP_CHECK = 1
+# How long to wait for the patient Priority window to appear after the Edit
+# button opens an Rx. Bumped from the legacy hardcoded 10s — Pioneer's
+# rendering of this modal slows down as the bot runs longer, and missing
+# the popup cascades into "Failed to connect" / "Failed to click Edit
+# Patient" downstream.
+TIMEOUT_PRIORITY_POPUP = 5
 TIMEOUT_AFTER_CLICK = 0.3
 TIMEOUT_AFTER_TYPE = 0.2
 TIMEOUT_AFTER_TAB = 0.3
@@ -119,7 +125,7 @@ SELECTOR_MAIN = r".*(MainForm|Fill Requests).*"
 SELECTOR_FILL_REQUESTS = r".*(Fill Requests|Rx Profile|MainForm).*"
 SELECTOR_RX_PROFILE = r".*Rx Profile.*"
 SELECTOR_EDIT_RX = r".*(Edit|Fill Rx|Rx Profile).*"
-SELECTOR_EDIT_RX_FULL = r".*(Edit|Fill Rx|Fill Requests|Search For a Prescriber|Search For|Search For Compounds|Alerts).*"
+SELECTOR_EDIT_RX_FULL = r".*(Edit|Fill Rx|Rx Profile|Fill Requests|Search For a Prescriber|Search For|Search For Compounds|Alerts).*"
 SELECTOR_EDIT_PATIENT = r".*(Edit Patient|Search For Third Party).*"    
 
 # ============================================================================

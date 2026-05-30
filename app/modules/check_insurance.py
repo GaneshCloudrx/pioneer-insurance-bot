@@ -48,19 +48,47 @@ def click_edit_patient():
 
 
 # Likely column header names for the payer/insurance display column in the
-# Pay Methods grid. We try these (case-insensitive) when extracting the
-# payer name from a matching row.
+# Pay Methods grid. We try these in priority order (case-insensitive); the
+# first match wins so that more specific headers like "Display Name" win
+# over the generic "Name". `"name"` is intentionally last so it doesn't
+# accidentally short-circuit on `"Cardholder Name"` (which we exclude
+# via the parser anyway).
 _PAYER_COLUMN_NAMES = (
     "display name",
     "payer name",
     "payer",
     "plan name",
     "plan",
+    "third party name",
+    "third party",
     "insurance",
     "name",
-    "third party",
-    "third party name",
 )
+
+
+def _parse_grid_column_header(raw):
+    """
+    Extract the human column header from a Pioneer pay-methods grid cell's
+    UIA `Name`.
+
+    Pioneer (UltraGrid) names every grid cell like:
+        "Name Row 0, Not sorted."
+        "Cardholder ID Row 0, Not sorted."
+        "Priority Row 0, Sorted ascending."
+
+    Everything before " Row <N>" is the real column header. If the suffix
+    isn't present we return the raw string (lowercased) so older grids
+    that name cells with just the header keep working.
+
+    Returns the header in lowercase, stripped. Empty string on failure.
+    """
+    if not raw:
+        return ""
+    text = str(raw).strip()
+    idx = text.find(" Row ")
+    if idx > 0 and idx + len(" Row ") < len(text) and text[idx + len(" Row ")].isdigit():
+        return text[:idx].strip().lower()
+    return text.lower()
 
 
 def has_insurance(card_holder_id):
@@ -107,15 +135,22 @@ def has_insurance(card_holder_id):
             if not child.window_text().startswith("Row"):
                 continue
 
+            # Map of parsed-column-header (lowercase) -> cell value, plus a
+            # parallel map of raw-column-header -> value kept only for the
+            # diagnostic log when extraction fails.
             row_cells = {}
+            row_cells_raw = {}
             row_matched = False
 
             for cell in child.children():
                 try:
-                    column = (cell.window_text() or "").strip()
+                    raw_column = (cell.window_text() or "").strip()
+                    header = _parse_grid_column_header(raw_column)
                     val = (cell.legacy_properties().get("Value", "") or "")
-                    if column:
-                        row_cells[column] = val
+                    if header:
+                        row_cells[header] = val
+                    if raw_column:
+                        row_cells_raw[raw_column] = val
                     cell_numeric = "".join(ch for ch in val if ch.isdigit())
                     if cell_numeric and numeric_id in cell_numeric:
                         row_matched = True
@@ -126,15 +161,18 @@ def has_insurance(card_holder_id):
                 continue
 
             payer_name = ""
-            for column, value in row_cells.items():
-                if column.strip().lower() in _PAYER_COLUMN_NAMES and value.strip():
+            for candidate in _PAYER_COLUMN_NAMES:
+                value = row_cells.get(candidate, "")
+                if value and value.strip():
                     payer_name = value.strip()
                     break
 
             if not payer_name:
                 log_print(
                     f"[INSURANCE] Cardholder ID '{numeric_id}' matched but payer "
-                    f"column not identified. Row columns: {list(row_cells.keys())}"
+                    f"column not identified. Parsed headers: "
+                    f"{list(row_cells.keys())} | Raw columns: "
+                    f"{list(row_cells_raw.keys())}"
                 )
             else:
                 log_print(
@@ -151,14 +189,46 @@ def has_insurance(card_holder_id):
         return False, ""
 
 
+_PCN_BLANK_TOKENS = frozenset({"na", "n/a", "null", "none", "any"})
+
+
 def _is_pcn_blank(pcn):
-    """Return True when the API's PCN should be treated as "no PCN"."""
+    """
+    Return True when the API's PCN should be treated as "no PCN" and the
+    Third Party search should be run on the BIN alone.
+
+    The check runs against the whole string AND against the first
+    whitespace-separated token, so all of these are recognized
+    (case-insensitive, after trimming):
+
+        ""                None / empty
+        "na" / "n/a"
+        "null" / "none"
+        "any"
+        "Any value"       -> first token "any"
+        "any (placeholder)"
+        "null value"
+        "n/a — see plan"
+
+    A leading punctuation token is also stripped so "(any)" / "[N/A]"
+    still register as blank.
+    """
     if pcn is None:
         return True
     cleaned = str(pcn).strip()
     if not cleaned:
         return True
-    return cleaned.lower() in ("na", "n/a", "null", "none")
+
+    lowered = cleaned.lower()
+    if lowered in _PCN_BLANK_TOKENS:
+        return True
+
+    # Compare the first whitespace-separated token after stripping common
+    # surrounding punctuation. Handles "Any value", "(Any)", "[N/A] foo",
+    # "null - whatever", etc.
+    head = lowered.split()[0] if lowered.split() else ""
+    head = head.strip("()[]{}<>\"'.,:;-")
+    return head in _PCN_BLANK_TOKENS
 
 
 def _click_first_uxcancel(parent, label):
@@ -354,6 +424,166 @@ def _search_third_party_by_bin_pcn(search_window, bin_number, pcn, pcn_blank):
     return _select_search_result(search_window, prefer_row_without_pcn=pcn_blank)
 
 
+def _find_confirm_pay_method_change(parent_window=None, total_wait=8.0):
+    """
+    Locate the "Confirm Pay Method Change" popup using several strategies in
+    parallel and poll until one finds it (or `total_wait` elapses).
+
+    The popup is a modal child of the **Edit Patient** window — the Pay
+    Method window has typically closed by the time it appears. pywinauto's
+    default `desktop.window(title_re=...)` is top-level only and misses
+    modal children, so we try:
+      1. Walk `parent_window.descendants(control_type="Window")` first
+         (caller should pass the Edit Patient window — that's where the
+         popup lives)
+      2. Fresh Desktop top-level by title (cheap, sometimes hits)
+      3. Enumerate `Desktop.windows()` and match by title text
+      4. Broad sweep of `desktop.descendants(control_type="Window")`
+
+    Returns the matching pywinauto wrapper, or None.
+    """
+    title_substr = "Confirm Pay Method Change"
+    title_re = ".*Confirm Pay Method Change.*"
+    deadline = time.time() + total_wait
+
+    def _is_popup(elem):
+        try:
+            t = (elem.window_text() or "").strip()
+            return title_substr in t
+        except Exception:
+            return False
+
+    while time.time() < deadline:
+        # 1. Descendants of the parent (Edit Patient) — most reliable
+        if parent_window is not None:
+            try:
+                for d in parent_window.descendants(control_type="Window"):
+                    if _is_popup(d):
+                        log_print(
+                            "[INSURANCE] Popup located under Edit Patient descendants"
+                        )
+                        return d
+            except Exception:
+                pass
+
+        # Fresh Desktop so pywinauto's internal cache doesn't hide a window
+        # that was just opened by Pioneer.
+        try:
+            desk = Desktop(backend="uia")
+        except Exception:
+            desk = None
+
+        # 2. Top-level lookup by title
+        if desk is not None:
+            try:
+                w = desk.window(title_re=title_re, control_type="Window")
+                if w.exists(timeout=0):
+                    log_print("[INSURANCE] Popup located via Desktop.window(title_re=...)")
+                    return w.wrapper_object()
+            except Exception:
+                pass
+
+        # 3. Enumerate top-level windows; match title substring
+        if desk is not None:
+            try:
+                for top in desk.windows():
+                    if _is_popup(top):
+                        log_print("[INSURANCE] Popup located via Desktop.windows() scan")
+                        return top
+            except Exception:
+                pass
+
+        # 4. Broader sweep of all Window descendants under the desktop
+        if desk is not None:
+            try:
+                for d in desk.descendants(control_type="Window"):
+                    if _is_popup(d):
+                        log_print("[INSURANCE] Popup located via Desktop.descendants() sweep")
+                        return d
+            except Exception:
+                pass
+
+        time.sleep(0.4)
+
+    return None
+
+
+def _click_make_previous_optional(popup):
+    """
+    Click the "Make Previous Optional (F3)" button on the supplied popup.
+    Tries the auto_id, then falls back to title-substring, then F3 keystroke.
+
+    Returns True on best-effort dismissal (any of those succeeded), False if
+    no popup wrapper was supplied.
+    """
+    if popup is None:
+        return False
+
+    try:
+        popup.set_focus()
+    except Exception:
+        pass
+
+    # Preferred locator: auto_id="uxOptional"
+    try:
+        btn = popup.child_window(auto_id="uxOptional", control_type="Button")
+        btn.wait('visible', timeout=2)
+        btn.click_input()
+        log_print("[INSURANCE] Clicked 'Make Previous Optional' via auto_id=uxOptional")
+        time.sleep(0.6)
+        return True
+    except Exception as e:
+        log_print(f"[INSURANCE] uxOptional click attempt failed: {e}")
+
+    # Fallback: find by title substring among descendant buttons
+    try:
+        for btn in popup.descendants(control_type="Button"):
+            title = (btn.window_text() or "").strip()
+            if "Make Previous Optional" in title:
+                btn.click_input()
+                log_print(f"[INSURANCE] Clicked button by title: '{title}'")
+                time.sleep(0.6)
+                return True
+    except Exception as e:
+        log_print(f"[INSURANCE] Button-by-title fallback failed: {e}")
+
+    # Last resort: F3 keystroke (the popup's own shortcut)
+    log_print("[INSURANCE] Falling back to F3 keystroke for Make Previous Optional")
+    send_keys("{F3}")
+    time.sleep(0.6)
+    return True
+
+
+def _handle_confirm_pay_method_change(desktop, parent_window=None):
+    """
+    After clicking Save on a newly-added Pay Method, Pioneer sometimes opens a
+    "Confirm Pay Method Change" window asking what to do with the patient's
+    previously-active plan. We always pick "Make Previous Optional (F3)"
+    (button `uxOptional`) so the freshly-added plan stays Primary and the
+    prior one is demoted to Optional.
+
+    Args:
+        desktop: A `pywinauto.Desktop(backend="uia")` instance.
+        parent_window: The Edit Patient window — the popup's actual parent.
+            When supplied, the locator walks its descendants first (fastest
+            and most reliable path). Falls back to desktop-wide search if
+            this isn't provided or the popup isn't found there.
+
+    Best-effort: never raises. Returns True if the popup was found and
+    dismissed, False otherwise.
+    """
+    popup = _find_confirm_pay_method_change(
+        parent_window=parent_window, total_wait=8.0
+    )
+    if popup is None:
+        log_print(
+            "[INSURANCE] No 'Confirm Pay Method Change' popup detected within timeout"
+        )
+        return False
+
+    return _click_make_previous_optional(popup)
+
+
 def _read_pay_method_display_name(pay_window):
     """
     Read the Display Name field (`uxDisplayName`) on the Pay Method (Third
@@ -545,7 +775,25 @@ def add_insurance_to_grid(payer_name, bin_number="", pcn="", card_holder_id="", 
         # Save pay method
         save_btn = pay_window.child_window(auto_id="uxSave", control_type="Button")
         save_btn.click_input()
-        time.sleep(1)
+
+        # Pioneer sometimes opens "Confirm Pay Method Change" right after
+        # Save (when the patient already had an active Primary). The popup
+        # is a modal child of the **Edit Patient** window (the Pay Method
+        # window has typically closed by then), so we re-resolve a fresh
+        # Edit Patient handle and pass it in as the parent. Click "Make
+        # Previous Optional (F3)" so the new plan stays Primary.
+        try:
+            fresh_desktop = Desktop(backend="uia")
+            edit_parent = fresh_desktop.window(
+                title_re=config.SELECTOR_EDIT_PATIENT, control_type="Window"
+            )
+        except Exception:
+            fresh_desktop = desktop
+            edit_parent = edit_window
+        _handle_confirm_pay_method_change(fresh_desktop, parent_window=edit_parent)
+
+        # Brief settle before the next check
+        time.sleep(0.5)
 
         # Check if Error Warning List popup appeared (insurance plan not found)
         try:
@@ -708,16 +956,20 @@ def check_and_add_insurance(insurance_data, cld_patient_id=None):
 
 
 if __name__ == "__main__":
-    #use this data as test insurance data "payer":"Blue cross blue shield","card_holder_id":"Wyo919752481","group_number":"Bcbsman","bin":"610011","pcn":"Na"
+    #test the find confirm pay method change function
+    #desktop = Desktop(backend="uia")
+    #pay_window = desktop.window(title_re=config.SELECTOR_EDIT_PATIENT, control_type="Window")
+    #_handle_confirm_pay_method_change(desktop, pay_window=pay_window)
+    #use this data as test insurance data payer":"Anthem Blue Cross EPO Plus-Plan A","card_holder_id":"SXR540W25908","group_number":"RXGRP","bin":"004336","pcn":"ADV
     test_insurance = {
-        "payer": "Blue cross blue shield",
-        "card_holder_id": "Wyo9197524812",
-        "group_number": "Bcbsman",
-        "bin": "610011",
-        "pcn": "IRX"
+        "payer": "Anthem Blue Cross EPO Plus-Plan A",
+        "card_holder_id": "SXR540W25908",
+        "group_number": "RXGRP",
+        "bin": "004336",
+        "pcn": "ADV"
     }
     status, insurance_name = check_and_add_insurance(test_insurance)
-    log_print(f"\nResult: status='{status}', insurance_name='{insurance_name}'")
+    #log_print(f"\nResult: status='{status}', insurance_name='{insurance_name}'")
     if status in (INSURANCE_EXISTS, INSURANCE_ADDED):
         log_print("TEST PASSED")
     else:

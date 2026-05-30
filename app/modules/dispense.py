@@ -46,6 +46,13 @@ def read_primary_value():
     """
     Read the current value of the Primary insurance combo on the Dispense tab.
 
+    Pioneer's Primary combo is a Win32 `CBS_DROPDOWNLIST` — its inner Edit
+    child (auto_id="1001") is permanently hidden and reports an empty
+    `Value.Value`. The text the user sees lives on the ComboBox itself, so
+    we delegate to `select_primary_insurance._read_combo_value` which tries
+    the UIA `Value` pattern, MSAA legacy value, the selected ListItem child,
+    and combo.window_text() in order.
+
     Returns:
         str: The combo's displayed value (e.g.
              "(P)BCBS OF Michigan - 610011 - WYO919752481 - BCBSMAN"),
@@ -57,10 +64,11 @@ def read_primary_value():
         return ""
 
     try:
+        # Imported lazily to avoid a circular import at module load.
+        from modules.select_primary_insurance import _read_combo_value
         window = _app.window(title_re=config.SELECTOR_EDIT_RX_FULL)
         primary_combo = window.child_window(title="Primary:", control_type="ComboBox")
-        primary_edit = primary_combo.child_window(auto_id="1001", control_type="Edit")
-        value = primary_edit.legacy_properties().get("Value", "") or ""
+        value = _read_combo_value(primary_combo)
         log_print(f"[DISPENSE] Primary value: '{value}'")
         return value
     except Exception as e:
@@ -160,7 +168,13 @@ def toggle_daw():
 
 
 if __name__ == "__main__":
-    if toggle_daw():
-        log_print("\nTEST PASSED")
-    else:
-        log_print("\nTEST FAILED")
+    #use this as test data "insurance":{"primary":{"payer":"umr","card_holder_id":"48454249","group_number":"hnnepin","bin":"610011","pcn":"IRX"}
+    test_insurance = {
+        "primary": {
+            "payer": "umr",
+            "card_holder_id": "48454249",
+            "group_number": "hnnepin",
+            "bin": "610011",
+            "pcn": "IRX"
+        }
+    }

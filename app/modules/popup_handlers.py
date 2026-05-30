@@ -21,6 +21,12 @@ def click_cancel_priority():
     Click Cancel on the Priority window if it appears.
     Window title is dynamic, e.g. "Kelsey Carter's Priority"
 
+    Wait length is `config.TIMEOUT_PRIORITY_POPUP` (default 30s). Bumped
+    from the legacy hardcoded 10s because Pioneer's modal rendering slows
+    down after the bot has been running for a while and a too-short wait
+    silently misses the popup — which cascades into "Failed to connect"
+    and "Failed to click Edit Patient" on subsequent steps.
+
     Returns:
         bool: True if priority window was found and cancelled
     """
@@ -28,7 +34,7 @@ def click_cancel_priority():
         app = get_pioneer_app()
         window = app.window(title_re=config.SELECTOR_EDIT_RX_FULL)
         priority_win = window.child_window(title_re=".*Priority.*", control_type="Window")
-        if not priority_win.exists(timeout=10):
+        if not priority_win.exists(timeout=config.TIMEOUT_PRIORITY_POPUP):
             return False
         cancel_btn = priority_win.child_window(auto_id="uxCancel", control_type="Button")
         cancel_btn.click_input()
